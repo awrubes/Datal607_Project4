@@ -1,0 +1,229 @@
+---
+title: "Project4"
+author: "aw"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Project 4 - Text Classification
+
+For project 4, I created a text classification model to help predict whether or not emails are spam. For this project, I used a corpus of email data (both ham and spam emails). In order to run this script locally, you MUST clone my github repository on your local machine.
+
+You can access the repo here \<<https://github.com/awrubes/Datal607_Project4>\>
+
+```{r libraries, warning=FALSE, message=FALSE}
+
+library(tidyverse)
+library(tidytext)
+library(knitr)
+library(readtext)
+library(dplyr)
+library(stringr)
+library(rvest)
+library(tm)
+library(e1071)
+```
+
+## Loading and Cleaning Data
+
+We'll start by loading in the necessary data for this nlp task. You'll need to clone the github locally in order to run this script.
+
+```{r folders}
+
+#you'll need to replace with the path to the local GitHub Repo 
+repofolder <- "/Users/alliewrubel/Documents/GitHub/Datal607_Project4"
+ham_folder <- paste0(repofolder, "/easy_ham/")
+spam_folder <- paste0(repofolder, "/spam/")
+
+#read files from the ham and spam folders, respectively
+ham_files <- list.files(ham_folder, full.names = TRUE)
+spam_files <- list.files(spam_folder, full.names = TRUE)
+```
+
+#### Analyzing Data Structure
+
+With all of the necessary files stored locally, we can iteratively move through each file using a helper function. Looking at the email structure, we see that we'll want to exclusively look at the body content, ignoring all header and metadata content that precedes it. A common pattern among files is that the body content is separated from header content by a blank line. So we'll take all content that follows this blank line.
+
+```{r read_function}
+
+#function to iteratively go through files in both folders and read in contents, as readlines, ignoring content up until first line break (indicates beginning of body of email) 
+
+read_emails_to_df <- function(file_paths, label) {
+  email_list <- lapply(file_paths, function(file) {
+    email_content <- readLines(file, warn = FALSE)
+    
+    # Identify the first blank line and extract the content after it
+    body_start <- which(email_content == "")[1] + 1
+    if (!is.na(body_start)) {
+      email_body <- email_content[body_start:length(email_content)] 
+      email_text <- paste(email_body, collapse = " ")  
+    } else {
+      email_text <- NA  # No body found
+    }
+    
+    return(email_text)
+  })
+  
+  # Create dataframe with text col and spam col
+  email_df <- data.frame(
+    text = unlist(email_list),  
+    spam = label,
+    stringsAsFactors = FALSE
+  )
+  
+  return(email_df)
+}
+
+#run functions on both ham and spam folders then combine into single dataframe
+ham_df <- read_emails_to_df(ham_files, label = 0)
+spam_df <- read_emails_to_df(spam_files, label = 1)
+email_data_raw <- rbind(ham_df, spam_df)
+
+kable(head(email_data_raw, 5), caption = "Raw Email Data")
+```
+
+#### Cleaning Raw Data
+
+Raw email text often contains irrelevant information (e.g., headers, metadata) that can negatively impact the model. So, let's use the \`clean_text\` helper function to preprocess the data by:
+
+-   Removing URLs, numbers, and special characters and replacing with \<NUM\> or \<URL\> so that we can still count frequency without the additional noise of having too many unique urls or numeric values in the training data for our model.
+
+-   Standardizing to lowercase – this is necessary for word tokenization.
+
+-   Removing redundant whitespace.
+
+```{r cleaning}
+
+#function to clean the text portion of the email using regex expressions to remove unnecessary or unhelpful words that might add noise to model learning
+clean_text <- function(email_text) {
+  email_text <- str_squish(email_text)
+  email_text <- str_replace_all(email_text, "http\\S+|www\\S+", "<URL>")
+  
+  email_text <- str_remove_all(email_text, "(?i)^(From|To|Subject|Date|Received|Return-Path|Delivered-To|Message-ID|X-.*|Content-.*|Mime-Version|Thread-Index|Precedence|List-Id|Errors-To):.*?(\\n\\s.*?)*")
+  
+  email_text <- str_remove_all(email_text, "[^[:alnum:][:punct:]\\s]")
+  
+  email_text <- str_replace_all(email_text, "\\b\\d+\\b", "<NUM>")
+  
+  email_text <- tolower(email_text)
+  
+  email_text <- str_squish(email_text)
+  return(email_text)
+}
+
+#apply the cleaning function to email df
+email_data_cleaned <- email_data_raw %>%
+  mutate(cleaned_text = clean_text(text))
+
+```
+
+## Natural Language Processing
+
+#### Pre-processing for Text Mining
+
+For this particular NLP classification task, we'll be using a Naive Bayes model, since it is computationally fast, relatively easy to train, and performs well with relatively little training data. It is also broadly used in spam classification as is.
+
+To build the Naive Bayes model, we need to further transform the cleaned text into a format suitable for machine learning. In order to do so, we'll:
+
+-   Create unique id col for cleaned dataframe, so that we can accurately track.
+
+-   Tokenize the text.
+
+-   Create a Document-Term Matrix (DTM) that represents the frequency of each term.
+
+-   Reduce sparsity to improve model performance (after some tests, I found that a lower value for term sparsity drastically improved the model's performance).
+
+```{r nlp_prep}
+
+#ensure that all content is UTF-8 so that it can be processed for nlp
+email_data_cleaned$text <- iconv(email_data_cleaned$text, from = "latin1", to = "UTF-8", sub = "")
+
+#add col of unique identifiers, this is necessary for nlp processing to ensure labels and text are aligned
+email_data_cleaned <- email_data_cleaned %>%
+  mutate(doc_id = row_number())
+
+kable(head(email_data_cleaned, 5), caption = "Cleaned Email Data")
+```
+
+#### Creating a Corpus
+
+In the name of clean data, we'll create a corpus and clean the corpus using the **tm library**. Once created, we can move forward with creating the document term matrix, which will track the frequency of occurrences of words and their corresponding labels (either ham or spam, 0 or 1).
+
+```{r nlp_model}
+
+# Create corpus using the email_data_cleaned df and clean once more to ensure it's preprocessed
+corpus <- VCorpus(VectorSource(email_data_cleaned$text))
+names(corpus) <- email_data_cleaned$doc_id
+corpus <- tm_map(corpus, content_transformer(tolower))
+corpus <- tm_map(corpus, removePunctuation)
+corpus <- tm_map(corpus, removeNumbers)
+corpus <- tm_map(corpus, removeWords, stopwords("en"))
+corpus <- tm_map(corpus, stripWhitespace)
+
+# create Document-Term Matrix
+dtm <- DocumentTermMatrix(corpus)
+
+# reduce sparsity - .9 is best
+dtm_reduced <- removeSparseTerms(dtm, 0.90)
+dtm_matrix <- as.matrix(dtm_reduced)
+
+head(dtm_matrix)
+```
+
+#### Train-Test Split
+
+To evaluate the model, we split the data into training and testing sets:
+**Training set:** 80% of the data, used to train the Naive Bayes model.
+**Testing set:** 20% of the data, used to assess the model's accuracy.
+
+```{r testing}
+
+# align labels with the reduced matrix using doc_id
+labels <- email_data_cleaned %>%
+  filter(doc_id %in% rownames(dtm_matrix)) %>%
+  pull(spam)
+
+set.seed(123)  # for reproducibility
+
+# create training and testing indices, 80/20 split between testing and training data
+train_indices <- sample(1:nrow(dtm_matrix), 0.8 * nrow(dtm_matrix))
+test_indices <- setdiff(1:nrow(dtm_matrix), train_indices)
+
+# split the data
+train_data <- dtm_matrix[train_indices, ]
+test_data <- dtm_matrix[test_indices, ]
+train_labels <- labels[train_indices]
+test_labels <- labels[test_indices]
+
+```
+
+#### Model Training and Evaluation
+
+The Naive Bayes classifier is trained on the training set and evaluated on the testing set. Accuracy is calculated as the percentage of correctly classified emails. With this current setup, the NB model consistently gets an **accuracy score of 85%**, which is significantly better than random guessing (50%). Though there's definite room for improvement.
+
+```{r training}
+
+# train Naive Bayes classifier
+nb_model <- naiveBayes(train_data, as.factor(train_labels))
+
+# make predictions using test_data
+nb_predictions <- predict(nb_model, test_data)
+
+# calculate accuracy of model to predict spam
+accuracy <- 100*(sum(nb_predictions == test_labels) / length(test_labels))
+print(paste("Model Accuracy:", accuracy, "%"))
+```
+
+## Conclusion
+
+This current workflow is able to produce a spam classification model that can predict whether an email is spam or not 85% of the time. This is a pretty good starting point, however there's much room for improvement. Here are some steps we can take to potentially increase model accuracy and performance:
+
+1.  Enhance data cleaning – cleaning email data is hard, especially given the varied nature of email file structure. That said, there are more improvements that can be made to the pre-processing steps in order to isolate key portions of the email data.
+
+2.  Imbalanced training data - the number of ham versus spam emails differs drastically (+2,000 versus 500, respectively). This means the model is trained on more non-spam emails than spam emails. In order to increase the accuracy of the model it might be best to balance the data, making it a more even distribution between spam and ham emails.
+
+3.  Remove Sparseness – typically, removesparseterms is set to .99, but with this given dataset, model performance improved drastically (\>30%) when the sparseness was decreased to .9. Playing around with this value could yield greater gains in terms of model performance.
